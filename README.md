@@ -23,7 +23,7 @@ consulta y control de los préstamos de equipos de manera sencilla y organizada.
 - Python
 - JSON (almacenamiento de datos)
 - Microsoft Excel (apoyo para la gestión de información)
-- PyInstaller (generación del ejecutable e interfaz)
+- PyInstaller (generación del ejecutable)
 
 ## Estructura del proyecto
 
