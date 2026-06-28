@@ -1,0 +1,28 @@
+{
+    "prestamos": [
+        {
+            "id": "16fc8f9d-fb10-4819-acfc-8b5cb14c5380",
+            "matricula": "2213013142",
+            "salon": "B102",
+            "equipo": "Laptop 20",
+            "proyector": "Proyector 4",
+            "extras": "EXTENSION, HDMI",
+            "hora_salida": "2026-06-20T12:24:24.066684",
+            "hora_limite": "2026-06-20T14:24:24.066684",
+            "hora_devolucion": "2026-06-20T12:44:01.893764",
+            "estado": "DEVUELTO"
+        },
+        {
+            "id": "62bb67dd-2984-4fe2-9646-0bc51ce69656",
+            "matricula": "2213013145",
+            "salon": "B105",
+            "equipo": "Laptop 17",
+            "proyector": "Proyector 9",
+            "extras": "EXTENSION, HDMI",
+            "hora_salida": "2026-06-25T19:25:22.816327",
+            "hora_limite": "2026-06-25T21:25:22.816327",
+            "hora_devolucion": "2026-06-25T19:30:43.552909",
+            "estado": "DEVUELTO"
+        }
+    ]
+}
