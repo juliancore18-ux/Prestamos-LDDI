@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import uuid
@@ -10,8 +11,8 @@ from PyQt6.QtWidgets import (
     QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
     QAbstractItemView, QFrame, QGraphicsDropShadowEffect,
 )
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont, QColor, QBrush
+from PyQt6.QtCore import Qt, QTimer, QRegularExpression
+from PyQt6.QtGui import QFont, QColor, QBrush, QRegularExpressionValidator
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -19,9 +20,7 @@ from openpyxl.utils import get_column_letter
 
 
 # =============================================================
-# SISTEMA DE PRÉSTAMOS — LDDI (versión PyQt6)
-# Solo se modificó la capa visual (Theme + construcción de UI).
-# La lógica de negocio (DB, servicio, Excel) permanece intacta.
+# SISTEMA DE PRÉSTAMOS — LDDI (versión PyQt6, corregida)
 # =============================================================
 
 
@@ -57,12 +56,6 @@ class Theme:
     STATUS_BG     = "#EEF1F4"
 
     FONT_FAMILY   = "Segoe UI"
-
-    FONT_TITLE  = (FONT_FAMILY, 15, "bold")
-    FONT_HEAD   = (FONT_FAMILY, 12, "bold")
-    FONT_BODY   = (FONT_FAMILY, 10)
-    FONT_SMALL  = (FONT_FAMILY, 9)
-    FONT_HINT   = (FONT_FAMILY, 8, "italic")
 
     @staticmethod
     def qss(font_family: str) -> str:
@@ -161,6 +154,7 @@ class Theme:
         }}
         QPushButton#btnPrimary:hover  {{ background-color: {Theme.PRIMARY_HOVER}; }}
         QPushButton#btnPrimary:pressed {{ background-color: {Theme.PRIMARY_PRESS}; }}
+        QPushButton#btnPrimary:disabled {{ background-color: #A8C9AF; }}
 
         QPushButton#btnSecondary {{
             background-color: {Theme.ACCENT};
@@ -173,6 +167,7 @@ class Theme:
         }}
         QPushButton#btnSecondary:hover  {{ background-color: #0D47A1; }}
         QPushButton#btnSecondary:pressed {{ background-color: #09367A; }}
+        QPushButton#btnSecondary:disabled {{ background-color: #90AEDB; }}
 
         /* ---------- GroupBox ---------- */
         QGroupBox {{
@@ -256,10 +251,17 @@ class Config:
 
     MATRICULA_MAX  = 10
     MATRICULA_MIN  = 5
+    MATRICULA_RE   = re.compile(r"^[0-9]+$")
     DURACION_HORAS = 2
     ALERTA_MINUTOS = 15
 
-    BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+    # Si la app corre "congelada" (PyInstaller, etc.) sys.executable apunta
+    # al .exe; si corre como script normal, usamos la ruta del propio archivo.
+    if getattr(sys, "frozen", False):
+        BASE_DIR = os.path.dirname(sys.executable)
+    else:
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
     JSON_PATH  = os.path.join(BASE_DIR, "prestamos.json")
     EXCEL_PATH = os.path.join(BASE_DIR, "PRESTAMOS.xlsx")
     HEADERS    = [
@@ -306,6 +308,10 @@ class PrestamosDB:
             )
             self.data = {"prestamos": []}
 
+        # Blindaje: si el JSON no tiene la forma esperada, no truena la app.
+        if not isinstance(self.data, dict) or not isinstance(self.data.get("prestamos"), list):
+            self.data = {"prestamos": []}
+
     def save(self):
         """Escritura atómica para evitar corrupción."""
         tmp = self.path + ".tmp"
@@ -328,7 +334,7 @@ class PrestamosDB:
 
     def activos(self) -> list:
         self._reload()
-        return [p for p in self.data["prestamos"] if p["estado"] == "PRESTADO"]
+        return [p for p in self.data["prestamos"] if p.get("estado") == "PRESTADO"]
 
     def todos(self) -> list:
         self._reload()
@@ -399,9 +405,14 @@ class PrestamoService:
         if not prestamo:
             return None
 
-        ahora        = datetime.datetime.now()
-        limite       = datetime.datetime.fromisoformat(prestamo["hora_limite"])
-        estado_final = "DEVUELTO TARDE" if ahora > limite else "DEVUELTO"
+        ahora = datetime.datetime.now()
+        try:
+            limite = datetime.datetime.fromisoformat(prestamo["hora_limite"])
+            estado_final = "DEVUELTO TARDE" if ahora > limite else "DEVUELTO"
+        except (TypeError, ValueError):
+            # Fecha límite corrupta/ilegible: se marca como tardía por seguridad
+            # en vez de tronar la aplicación.
+            estado_final = "DEVUELTO TARDE"
         return self.db.devolver(prestamo_id, estado_final, ahora.isoformat())
 
     def validar(
@@ -414,8 +425,8 @@ class PrestamoService:
         """Devuelve mensaje de error o None si todo es válido."""
         if not matricula:
             return "La matrícula es requerida."
-        if not matricula.isdigit():
-            return "La matrícula debe contener solo dígitos."
+        if not Config.MATRICULA_RE.fullmatch(matricula):
+            return "La matrícula debe contener solo dígitos (0-9)."
         if len(matricula) < Config.MATRICULA_MIN:
             return f"La matrícula debe tener al menos {Config.MATRICULA_MIN} dígitos."
         if len(matricula) > Config.MATRICULA_MAX:
@@ -469,8 +480,13 @@ class Excel:
         wb.save(self.path)
 
     def _fmt_hora(self, iso: str) -> str:
-        """Formatea un string ISO a 'YYYY-MM-DD HH:MM', o '' si vacío."""
-        return iso[:16].replace("T", " ") if iso else ""
+        """Formatea un string ISO a 'YYYY-MM-DD HH:MM', o '' si vacío/ inválido."""
+        if not iso:
+            return ""
+        try:
+            return datetime.datetime.fromisoformat(iso).strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            return iso[:16].replace("T", " ")
 
     def actualizar_o_agregar(self, prestamo: dict):
         if not os.path.exists(self.path):
@@ -484,6 +500,22 @@ class Excel:
                 "Archivo bloqueado",
                 f"No se pudo acceder a '{self.path}'.\n"
                 "Cierra el archivo en Excel e intenta de nuevo.",
+            )
+            return
+        except Exception as e:
+            QMessageBox.critical(
+                None,
+                "Error al abrir Excel",
+                f"No se pudo abrir '{self.path}':\n{e}",
+            )
+            return
+
+        if "Registros" not in wb.sheetnames:
+            QMessageBox.critical(
+                None,
+                "Formato inesperado",
+                "El archivo Excel no contiene la hoja 'Registros'.\n"
+                "Renómbralo o elimínalo para que se regenere automáticamente.",
             )
             return
 
@@ -536,6 +568,12 @@ class Excel:
                 f"No se pudo guardar '{self.path}'.\n"
                 "Cierra el archivo en Excel e intenta de nuevo.",
             )
+        except Exception as e:
+            QMessageBox.critical(
+                None,
+                "Error al guardar Excel",
+                f"No se pudo guardar '{self.path}':\n{e}",
+            )
 
 
 # =============================================================
@@ -546,7 +584,10 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sistema de Préstamos de Equipos")
-        self.setFixedSize(720, 740)
+        # Tamaño mínimo en vez de fijo: evita que se recorten controles en
+        # equipos con distinta escala de fuente/DPI, y permite maximizar.
+        self.setMinimumSize(720, 740)
+        self.resize(720, 740)
         self.setStyleSheet(Theme.qss(Theme.FONT_FAMILY))
 
         self.db      = PrestamosDB(Config.JSON_PATH)
@@ -558,6 +599,21 @@ class App(QMainWindow):
 
         self._ui()
         self._monitorear()
+
+    # ----------------------------------------------------------
+    # UTILIDADES
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def _parse_dt(iso: str) -> datetime.datetime | None:
+        """Parseo seguro de fechas ISO. Devuelve None si el valor es
+        inválido en vez de tronar toda la interfaz por un registro dañado."""
+        if not iso:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(iso)
+        except (TypeError, ValueError):
+            return None
 
     # ----------------------------------------------------------
     # CONSTRUCCIÓN DE UI
@@ -572,7 +628,7 @@ class App(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # ---- Cabecera con degradado sutil ----
+        # ---- Cabecera ----
         header = QFrame()
         header.setStyleSheet(
             f"background-color: {Theme.PRIMARY_DARK};"
@@ -581,14 +637,23 @@ class App(QMainWindow):
         header_layout.setContentsMargins(24, 16, 24, 16)
         header_layout.setSpacing(2)
 
+        # NOTA: el tamaño de fuente se fija aquí, en el stylesheet propio del
+        # widget, y no solo con setFont(). La regla global "QLabel { font-size:
+        # 10pt; }" de Theme.qss() tiene prioridad sobre setFont() en Qt, así que
+        # si solo se usa setFont() estas etiquetas terminan viéndose todas del
+        # mismo tamaño (10pt) sin importar lo que se pida en el código.
         titulo = QLabel("Sistema de Préstamos de Equipos")
         titulo.setFont(QFont(Theme.FONT_FAMILY, 15, QFont.Weight.Bold))
-        titulo.setStyleSheet("color: white; background: transparent;")
+        titulo.setStyleSheet(
+            "color: white; background: transparent; font-size: 15pt; font-weight: bold;"
+        )
         header_layout.addWidget(titulo)
 
         subtitulo = QLabel("Laptops · Proyectores · Accesorios")
         subtitulo.setFont(QFont(Theme.FONT_FAMILY, 9))
-        subtitulo.setStyleSheet("color: rgba(255,255,255,0.75); background: transparent;")
+        subtitulo.setStyleSheet(
+            "color: rgba(255,255,255,0.75); background: transparent; font-size: 9pt;"
+        )
         header_layout.addWidget(subtitulo)
 
         main_layout.addWidget(header)
@@ -622,9 +687,14 @@ class App(QMainWindow):
     def _card(self) -> tuple[QFrame, QVBoxLayout]:
         """Crea un contenedor tipo 'tarjeta' con sombra suave."""
         card = QFrame()
+        # OJO: si se concatena un f-string con {{ }} y un string normal con
+        # }} sueltas, el }} del string normal NO se escapa (solo se escapa
+        # dentro del propio f-string) y sobra una llave de cierre, lo que
+        # hace que Qt descarte toda la hoja de estilos del QFrame. Por eso
+        # va todo en un único f-string.
         card.setStyleSheet(
             f"QFrame {{ background-color: {Theme.SURFACE}; border: 1px solid {Theme.BORDER}; "
-            "border-radius: 10px; }}"
+            f"border-radius: 10px; }}"
         )
         shadow = QGraphicsDropShadowEffect()
         shadow.setBlurRadius(18)
@@ -639,7 +709,12 @@ class App(QMainWindow):
     def _seccion_titulo(self, texto: str) -> QLabel:
         lbl = QLabel(texto)
         lbl.setFont(QFont(Theme.FONT_FAMILY, 12, QFont.Weight.Bold))
-        lbl.setStyleSheet(f"color: {Theme.PRIMARY_DARK}; background: transparent;")
+        # font-size va en el stylesheet propio (ver nota en _ui()): la regla
+        # global QLabel{font-size:10pt} de lo contrario aplasta este tamaño.
+        lbl.setStyleSheet(
+            f"color: {Theme.PRIMARY_DARK}; background: transparent; "
+            "font-size: 12pt; font-weight: bold;"
+        )
         return lbl
 
     def _ui_prestamo(self):
@@ -661,6 +736,14 @@ class App(QMainWindow):
         self.matricula_edit = QLineEdit()
         self.matricula_edit.setFixedWidth(220)
         self.matricula_edit.setPlaceholderText("Ej. 1234567")
+        self.matricula_edit.setMaxLength(Config.MATRICULA_MAX)
+        # Solo permite escribir dígitos: evita errores de captura desde el origen.
+        self.matricula_edit.setValidator(
+            QRegularExpressionValidator(
+                QRegularExpression(rf"^[0-9]{{0,{Config.MATRICULA_MAX}}}$")
+            )
+        )
+
         self.salon_edit = QLineEdit()
         self.salon_edit.setFixedWidth(220)
         self.salon_edit.setPlaceholderText("Ej. A-201")
@@ -705,7 +788,9 @@ class App(QMainWindow):
             "Un alumno no puede tener dos préstamos activos simultáneos."
         )
         aviso.setFont(QFont(Theme.FONT_FAMILY, 9))
-        aviso.setStyleSheet(f"color: {Theme.FG_MUTED}; background: transparent;")
+        aviso.setStyleSheet(
+            f"color: {Theme.FG_MUTED}; background: transparent; font-size: 9pt;"
+        )
         layout.addWidget(aviso)
 
         self.btn_prestar = QPushButton("Registrar préstamo")
@@ -720,7 +805,9 @@ class App(QMainWindow):
         creditos_font.setItalic(True)
         creditos = QLabel("CREADO EN LDDI")
         creditos.setFont(creditos_font)
-        creditos.setStyleSheet(f"color: {Theme.FG_HINT}; background: transparent;")
+        creditos.setStyleSheet(
+            f"color: {Theme.FG_HINT}; background: transparent; font-size: 8pt; font-style: italic;"
+        )
         outer.addWidget(creditos, alignment=Qt.AlignmentFlag.AlignHCenter)
 
     def _ui_devolucion(self):
@@ -831,7 +918,9 @@ class App(QMainWindow):
         self.devoluciones_map.clear()
         opciones = []
         for p in activos:
-            limite   = datetime.datetime.fromisoformat(p["hora_limite"])
+            limite = self._parse_dt(p.get("hora_limite"))
+            if limite is None:
+                continue  # registro dañado: se omite en vez de tronar la UI
             restante = int((limite - ahora).total_seconds() / 60)
             aviso = (
                 f"⚠ {restante} min" if 0 < restante <= Config.ALERTA_MINUTOS
@@ -848,11 +937,17 @@ class App(QMainWindow):
             self.cb_devolucion.setCurrentText(seleccion_actual)
         else:
             self.cb_devolucion.setCurrentText("")
-            self.info_label.setText("Selecciona un préstamo para ver detalles.")
         self.cb_devolucion.blockSignals(False)
 
+        # Como las señales estaban bloqueadas arriba, hay que refrescar el
+        # detalle (cuenta regresiva) a mano; si no, el texto de "min
+        # restantes" se quedaba congelado entre refrescos automáticos.
         if not opciones:
             self.info_label.setText("Sin préstamos activos.")
+        elif seleccion_actual in opciones:
+            self._mostrar_info_prestamo()
+        else:
+            self.info_label.setText("Selecciona un préstamo para ver detalles.")
 
         # Tabla con filtro por matrícula
         filas = [p for p in activos if not filtro or filtro in p["matricula"]]
@@ -865,8 +960,13 @@ class App(QMainWindow):
         }
 
         for row, p in enumerate(filas):
-            limite   = datetime.datetime.fromisoformat(p["hora_limite"])
-            restante = (limite - ahora).total_seconds() / 60
+            limite = self._parse_dt(p.get("hora_limite"))
+            if limite is None:
+                # Registro con fecha inválida: se muestra igual pero marcado como vencido,
+                # en vez de tronar toda la tabla.
+                restante = -1
+            else:
+                restante = (limite - ahora).total_seconds() / 60
             tag = (
                 "vencido"    if restante <= 0
                 else "por_vencer" if restante <= Config.ALERTA_MINUTOS
@@ -878,8 +978,8 @@ class App(QMainWindow):
                 p["equipo"]    or "-",
                 p["proyector"] or "-",
                 p.get("extras", "") or "-",
-                p["hora_salida"][11:16],
-                p["hora_limite"][11:16],
+                p["hora_salida"][11:16] if len(p.get("hora_salida", "")) >= 16 else "-",
+                p["hora_limite"][11:16] if len(p.get("hora_limite", "")) >= 16 else "-",
                 "VENCIDO" if restante <= 0 else "PRESTADO",
             )
             color = color_map[tag]
@@ -898,17 +998,29 @@ class App(QMainWindow):
         # Limpiar IDs ya devueltos del set de notificados
         self._notificados &= ids_activos
 
+        vencidos_nuevos = []
         for p in activos:
-            limite   = datetime.datetime.fromisoformat(p["hora_limite"])
+            limite = self._parse_dt(p.get("hora_limite"))
+            if limite is None:
+                continue
             restante = (limite - ahora).total_seconds() / 60
             if restante <= 0 and p["id"] not in self._notificados:
                 self._notificados.add(p["id"])
-                QMessageBox.warning(
-                    self,
-                    "Préstamo vencido",
-                    f"El préstamo de la matrícula {p['matricula']}\n"
-                    f"({p['equipo'] or '-'} / {p['proyector'] or '-'}) ha vencido.",
-                )
+                vencidos_nuevos.append(p)
+
+        # Se agrupan todos los vencimientos nuevos en un solo aviso, en vez
+        # de abrir una ventana modal por cada préstamo vencido.
+        if vencidos_nuevos:
+            detalle = "\n".join(
+                f"• Matrícula {p['matricula']} — {p['equipo'] or '-'} / {p['proyector'] or '-'}"
+                for p in vencidos_nuevos
+            )
+            plural = "s" if len(vencidos_nuevos) > 1 else ""
+            QMessageBox.warning(
+                self,
+                f"Préstamo{plural} vencido{plural}",
+                f"El{plural} siguiente{plural} préstamo{plural} ha{'n' if plural else ''} vencido:\n\n{detalle}",
+            )
 
         self._refresh()
         QTimer.singleShot(60_000, self._monitorear)
@@ -922,17 +1034,23 @@ class App(QMainWindow):
         if not p:
             return
 
-        limite   = datetime.datetime.fromisoformat(p["hora_limite"])
-        ahora    = datetime.datetime.now()
-        restante = int((limite - ahora).total_seconds() / 60)
-        estado_txt = f"⏱ {restante} min restantes" if restante > 0 else "🔴 TIEMPO VENCIDO"
+        limite = self._parse_dt(p.get("hora_limite"))
+        ahora  = datetime.datetime.now()
+        if limite is None:
+            estado_txt = "⚠ Fecha límite inválida"
+        else:
+            restante = int((limite - ahora).total_seconds() / 60)
+            estado_txt = f"⏱ {restante} min restantes" if restante > 0 else "🔴 TIEMPO VENCIDO"
+
+        salida_txt = p["hora_salida"][11:16] if len(p.get("hora_salida", "")) >= 16 else "N/A"
+        limite_txt = p["hora_limite"][11:16] if len(p.get("hora_limite", "")) >= 16 else "N/A"
 
         self.info_label.setText(
             f"Matrícula: {p['matricula']}    Aula: {p['salon']}\n"
             f"Laptop: {p['equipo'] or 'N/A'}    Proyector: {p['proyector'] or 'N/A'}\n"
             f"Extras: {p.get('extras', '') or 'N/A'}\n"
-            f"Salida: {p['hora_salida'][11:16]}    "
-            f"Límite: {p['hora_limite'][11:16]}    {estado_txt}"
+            f"Salida: {salida_txt}    "
+            f"Límite: {limite_txt}    {estado_txt}"
         )
 
     # ----------------------------------------------------------
@@ -973,6 +1091,13 @@ class App(QMainWindow):
         try:
             prestamo = self.service.crear_prestamo(matricula, salon, equipo, proy, extras)
             self.excel.actualizar_o_agregar(prestamo)
+        except Exception as e:
+            # Antes: cualquier excepción no prevista aquí tumbaba toda la app.
+            QMessageBox.critical(
+                self, "Error inesperado",
+                f"Ocurrió un error al registrar el préstamo:\n{e}",
+            )
+            return
         finally:
             self._set_busy(False)
 
@@ -1011,14 +1136,20 @@ class App(QMainWindow):
         self._set_busy(True)
         try:
             p = self.service.registrar_devolucion(prestamo_id)
+            if p:
+                self.excel.actualizar_o_agregar(p)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error inesperado",
+                f"Ocurrió un error al registrar la devolución:\n{e}",
+            )
+            return
         finally:
             self._set_busy(False)
 
         if not p:
             QMessageBox.critical(self, "Error", "No se encontró el préstamo en la base de datos.")
             return
-
-        self.excel.actualizar_o_agregar(p)
 
         if p["estado"] == "DEVUELTO TARDE":
             QMessageBox.warning(
