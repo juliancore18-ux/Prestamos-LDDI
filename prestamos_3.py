@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import sqlite3
 import json
 import uuid
 import datetime
@@ -20,7 +21,18 @@ from openpyxl.utils import get_column_letter
 
 
 # =============================================================
-# SISTEMA DE PRÉSTAMOS — LDDI (versión PyQt6, corregida)
+# SISTEMA DE PRÉSTAMOS — LDDI (versión PyQt6 + SQLite)
+# =============================================================
+#
+# Cambios respecto a la versión JSON:
+#   - PrestamosDB (JSON) se reemplaza por PrestamosRepository (SQLite).
+#   - Excel sigue existiendo tal cual, pero ahora es SOLO una capa de
+#     reporte/exportación: la fuente de verdad es la base SQLite.
+#   - PrestamoService no cambia ni una línea: sigue recibiendo un objeto
+#     con activos()/todos()/agregar()/devolver()/alumno_tiene_prestamo_activo(),
+#     sin importarle si detrás hay JSON o SQLite.
+#   - Si existe un prestamos.json previo, se migra automáticamente a
+#     SQLite la primera vez que corre esta versión.
 # =============================================================
 
 
@@ -255,14 +267,14 @@ class Config:
     DURACION_HORAS = 2
     ALERTA_MINUTOS = 15
 
-    # Si la app corre "congelada" (PyInstaller, etc.) sys.executable apunta
-    # al .exe; si corre como script normal, usamos la ruta del propio archivo.
     if getattr(sys, "frozen", False):
         BASE_DIR = os.path.dirname(sys.executable)
     else:
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+    # JSON_PATH se conserva solo para poder migrar datos antiguos, si existen.
     JSON_PATH  = os.path.join(BASE_DIR, "prestamos.json")
+    DB_PATH    = os.path.join(BASE_DIR, "prestamos.db")
     EXCEL_PATH = os.path.join(BASE_DIR, "PRESTAMOS.xlsx")
     HEADERS    = [
         "ID", "Matrícula", "Aula",
@@ -271,105 +283,199 @@ class Config:
         "Estado",
     ]
 
-    # Opciones vacías para los comboboxes
     SIN_LAPTOP    = "(ninguna)"
     SIN_PROYECTOR = "(ninguno)"
 
 
 # =============================================================
-# DATA
+# DATA — SQLite
 # =============================================================
 
-class PrestamosDB:
-    def __init__(self, path: str):
-        self.path = path
-        self.data: dict = {"prestamos": []}
-        self._load()
+class PrestamosRepository:
+    """
+    Reemplazo de PrestamosDB (que usaba JSON) usando SQLite como backend.
+    Expone exactamente la misma interfaz pública que la versión JSON
+    (activos, todos, agregar, devolver, alumno_tiene_prestamo_activo) para
+    que PrestamoService y la UI no necesiten cambiar nada.
+    """
 
-    def _load(self):
-        if not os.path.exists(self.path):
+    _SCHEMA = """
+        CREATE TABLE IF NOT EXISTS prestamos (
+            id               TEXT PRIMARY KEY,
+            matricula        TEXT NOT NULL,
+            salon            TEXT NOT NULL,
+            equipo           TEXT,
+            proyector        TEXT,
+            extras           TEXT,
+            hora_salida      TEXT,
+            hora_limite      TEXT,
+            hora_devolucion  TEXT,
+            estado           TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_prestamos_estado    ON prestamos(estado);
+        CREATE INDEX IF NOT EXISTS idx_prestamos_matricula ON prestamos(matricula);
+    """
+
+    def __init__(self, db_path: str, json_migrar_desde: str | None = None):
+        self.db_path = db_path
+        try:
+            # check_same_thread=False: la UI corre en un solo hilo (main
+            # thread de Qt), pero se deja explícito por si en el futuro se
+            # usa un QThread/worker para I/O.
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA foreign_keys = ON;")
+            # WAL mejora concurrencia y hace más resistente la escritura
+            # ante cierres abruptos (equivalente al "guardado atómico" que
+            # tenía la versión JSON con os.replace).
+            self._conn.execute("PRAGMA journal_mode = WAL;")
+            self._conn.executescript(self._SCHEMA)
+            self._conn.commit()
+        except sqlite3.Error as e:
+            QMessageBox.critical(
+                None,
+                "Error de base de datos",
+                f"No se pudo abrir o crear la base de datos SQLite:\n{e}",
+            )
+            raise
+
+        if json_migrar_desde and os.path.exists(json_migrar_desde):
+            self._migrar_desde_json(json_migrar_desde)
+
+    # ------------------------------------------------------
+    # Migración única desde la versión anterior en JSON
+    # ------------------------------------------------------
+    def _migrar_desde_json(self, json_path: str):
+        cur = self._conn.execute("SELECT COUNT(*) FROM prestamos;")
+        if cur.fetchone()[0] > 0:
+            return  # ya hay datos en SQLite, no se vuelve a migrar
+
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (IOError, json.JSONDecodeError):
             return
+
+        registros = data.get("prestamos", []) if isinstance(data, dict) else []
+        if not registros:
+            return
+
+        filas = []
+        for p in registros:
+            filas.append((
+                p.get("id") or str(uuid.uuid4()),
+                p.get("matricula", ""),
+                p.get("salon", ""),
+                p.get("equipo", ""),
+                p.get("proyector", ""),
+                p.get("extras", ""),
+                p.get("hora_salida", ""),
+                p.get("hora_limite", ""),
+                p.get("hora_devolucion", ""),
+                p.get("estado", "PRESTADO"),
+            ))
+
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO prestamos "
+            "(id, matricula, salon, equipo, proyector, extras, "
+            " hora_salida, hora_limite, hora_devolucion, estado) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?);",
+            filas,
+        )
+        self._conn.commit()
+
+        # Renombra el JSON viejo para dejar claro que ya no es la fuente
+        # de verdad, sin borrarlo (por si se quiere revisar a mano).
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                self.data = json.load(f)
-        except json.JSONDecodeError as e:
-            QMessageBox.critical(
-                None,
-                "Error de datos",
-                f"El archivo JSON está corrupto:\n{e}\n"
-                "Se iniciará con datos vacíos.",
-            )
-            self.data = {"prestamos": []}
-        except IOError as e:
-            QMessageBox.critical(
-                None,
-                "Error de archivo",
-                f"No se pudo leer el archivo de datos:\n{e}",
-            )
-            self.data = {"prestamos": []}
+            os.replace(json_path, json_path + ".migrado")
+        except OSError:
+            pass
 
-        # Blindaje: si el JSON no tiene la forma esperada, no truena la app.
-        if not isinstance(self.data, dict) or not isinstance(self.data.get("prestamos"), list):
-            self.data = {"prestamos": []}
+    # ------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------
+    @staticmethod
+    def _row_to_dict(row: sqlite3.Row) -> dict:
+        return dict(row)
 
-    def save(self):
-        """Escritura atómica para evitar corrupción."""
-        tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=4, ensure_ascii=False)
-            os.replace(tmp, self.path)
-        except IOError as e:
-            QMessageBox.critical(None, "Error al guardar", f"No se pudo guardar el archivo:\n{e}")
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-
-    def _reload(self):
-        """Recarga desde disco antes de operaciones críticas."""
-        self._load()
-
+    # ------------------------------------------------------
+    # Interfaz pública (idéntica a la versión JSON)
+    # ------------------------------------------------------
     def activos(self) -> list:
-        self._reload()
-        return [p for p in self.data["prestamos"] if p.get("estado") == "PRESTADO"]
+        cur = self._conn.execute(
+            "SELECT * FROM prestamos WHERE estado = 'PRESTADO' ORDER BY hora_salida;"
+        )
+        return [self._row_to_dict(r) for r in cur.fetchall()]
 
     def todos(self) -> list:
-        self._reload()
-        return self.data["prestamos"]
+        cur = self._conn.execute("SELECT * FROM prestamos ORDER BY hora_salida;")
+        return [self._row_to_dict(r) for r in cur.fetchall()]
 
     def agregar(self, prestamo: dict):
-        self._reload()
-        ids_existentes = {p["id"] for p in self.data["prestamos"]}
         nuevo_id = str(uuid.uuid4())
-        while nuevo_id in ids_existentes:
+        # Colisión de UUID es astronómicamente improbable, pero se revisa
+        # igual por consistencia con el comportamiento anterior.
+        while self._conn.execute(
+            "SELECT 1 FROM prestamos WHERE id = ?;", (nuevo_id,)
+        ).fetchone():
             nuevo_id = str(uuid.uuid4())
         prestamo["id"] = nuevo_id
-        self.data["prestamos"].append(prestamo)
-        self.save()
+
+        try:
+            self._conn.execute(
+                "INSERT INTO prestamos "
+                "(id, matricula, salon, equipo, proyector, extras, "
+                " hora_salida, hora_limite, hora_devolucion, estado) "
+                "VALUES (:id, :matricula, :salon, :equipo, :proyector, :extras, "
+                " :hora_salida, :hora_limite, :hora_devolucion, :estado);",
+                prestamo,
+            )
+            self._conn.commit()
+        except sqlite3.Error as e:
+            self._conn.rollback()
+            QMessageBox.critical(None, "Error al guardar", f"No se pudo guardar el préstamo:\n{e}")
+            raise
 
     def devolver(self, prestamo_id: str, estado_final: str, hora_devolucion: str) -> dict | None:
-        self._reload()
-        for p in self.data["prestamos"]:
-            if p["id"] == prestamo_id:
-                p["estado"]          = estado_final
-                p["hora_devolucion"] = hora_devolucion
-                self.save()
-                return p
-        return None
+        try:
+            cur = self._conn.execute(
+                "UPDATE prestamos SET estado = ?, hora_devolucion = ? WHERE id = ?;",
+                (estado_final, hora_devolucion, prestamo_id),
+            )
+            self._conn.commit()
+        except sqlite3.Error as e:
+            self._conn.rollback()
+            QMessageBox.critical(None, "Error al guardar", f"No se pudo registrar la devolución:\n{e}")
+            raise
+
+        if cur.rowcount == 0:
+            return None
+
+        row = self._conn.execute(
+            "SELECT * FROM prestamos WHERE id = ?;", (prestamo_id,)
+        ).fetchone()
+        return self._row_to_dict(row) if row else None
 
     def alumno_tiene_prestamo_activo(self, matricula: str) -> bool:
-        return any(p["matricula"] == matricula for p in self.activos())
+        row = self._conn.execute(
+            "SELECT 1 FROM prestamos WHERE matricula = ? AND estado = 'PRESTADO' LIMIT 1;",
+            (matricula,),
+        ).fetchone()
+        return row is not None
+
+    def cerrar(self):
+        try:
+            self._conn.close()
+        except sqlite3.Error:
+            pass
 
 
 # =============================================================
-# SERVICIO (lógica de negocio)
+# SERVICIO (lógica de negocio) — SIN CAMBIOS
 # =============================================================
 
 class PrestamoService:
-    def __init__(self, db: PrestamosDB):
+    def __init__(self, db):
         self.db = db
 
     def crear_prestamo(
@@ -398,7 +504,6 @@ class PrestamoService:
         return prestamo
 
     def registrar_devolucion(self, prestamo_id: str) -> dict | None:
-        """Calcula el estado ANTES de persistir."""
         prestamo = next(
             (p for p in self.db.activos() if p["id"] == prestamo_id), None
         )
@@ -410,8 +515,6 @@ class PrestamoService:
             limite = datetime.datetime.fromisoformat(prestamo["hora_limite"])
             estado_final = "DEVUELTO TARDE" if ahora > limite else "DEVUELTO"
         except (TypeError, ValueError):
-            # Fecha límite corrupta/ilegible: se marca como tardía por seguridad
-            # en vez de tronar la aplicación.
             estado_final = "DEVUELTO TARDE"
         return self.db.devolver(prestamo_id, estado_final, ahora.isoformat())
 
@@ -422,7 +525,6 @@ class PrestamoService:
         equipo: str,
         proyector: str,
     ) -> str | None:
-        """Devuelve mensaje de error o None si todo es válido."""
         if not matricula:
             return "La matrícula es requerida."
         if not Config.MATRICULA_RE.fullmatch(matricula):
@@ -441,7 +543,7 @@ class PrestamoService:
 
 
 # =============================================================
-# EXCEL
+# EXCEL — capa de reporte/exportación, SIN CAMBIOS DE FONDO
 # =============================================================
 
 class Excel:
@@ -480,7 +582,6 @@ class Excel:
         wb.save(self.path)
 
     def _fmt_hora(self, iso: str) -> str:
-        """Formatea un string ISO a 'YYYY-MM-DD HH:MM', o '' si vacío/ inválido."""
         if not iso:
             return ""
         try:
@@ -575,6 +676,18 @@ class Excel:
                 f"No se pudo guardar '{self.path}':\n{e}",
             )
 
+    def exportar_todo(self, registros: list):
+        """
+        Regenera el Excel completo a partir de TODOS los registros de
+        SQLite. Útil como reporte histórico completo (no solo el último
+        movimiento), por ejemplo desde un botón "Exportar historial".
+        """
+        if os.path.exists(self.path):
+            os.remove(self.path)
+        self._crear()
+        for p in registros:
+            self.actualizar_o_agregar(p)
+
 
 # =============================================================
 # APP
@@ -584,13 +697,14 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sistema de Préstamos de Equipos")
-        # Tamaño mínimo en vez de fijo: evita que se recorten controles en
-        # equipos con distinta escala de fuente/DPI, y permite maximizar.
         self.setMinimumSize(720, 740)
         self.resize(720, 740)
         self.setStyleSheet(Theme.qss(Theme.FONT_FAMILY))
 
-        self.db      = PrestamosDB(Config.JSON_PATH)
+        # Único cambio real de la App: se instancia el repositorio SQLite
+        # en vez de la base JSON. Si existe un prestamos.json de la versión
+        # anterior, se migra automáticamente la primera vez.
+        self.db      = PrestamosRepository(Config.DB_PATH, json_migrar_desde=Config.JSON_PATH)
         self.service = PrestamoService(self.db)
         self.excel   = Excel(Config.EXCEL_PATH)
 
@@ -606,14 +720,16 @@ class App(QMainWindow):
 
     @staticmethod
     def _parse_dt(iso: str) -> datetime.datetime | None:
-        """Parseo seguro de fechas ISO. Devuelve None si el valor es
-        inválido en vez de tronar toda la interfaz por un registro dañado."""
         if not iso:
             return None
         try:
             return datetime.datetime.fromisoformat(iso)
         except (TypeError, ValueError):
             return None
+
+    def closeEvent(self, event):
+        self.db.cerrar()
+        super().closeEvent(event)
 
     # ----------------------------------------------------------
     # CONSTRUCCIÓN DE UI
@@ -628,7 +744,6 @@ class App(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # ---- Cabecera ----
         header = QFrame()
         header.setStyleSheet(
             f"background-color: {Theme.PRIMARY_DARK};"
@@ -637,11 +752,6 @@ class App(QMainWindow):
         header_layout.setContentsMargins(24, 16, 24, 16)
         header_layout.setSpacing(2)
 
-        # NOTA: el tamaño de fuente se fija aquí, en el stylesheet propio del
-        # widget, y no solo con setFont(). La regla global "QLabel { font-size:
-        # 10pt; }" de Theme.qss() tiene prioridad sobre setFont() en Qt, así que
-        # si solo se usa setFont() estas etiquetas terminan viéndose todas del
-        # mismo tamaño (10pt) sin importar lo que se pida en el código.
         titulo = QLabel("Sistema de Préstamos de Equipos")
         titulo.setFont(QFont(Theme.FONT_FAMILY, 15, QFont.Weight.Bold))
         titulo.setStyleSheet(
@@ -685,13 +795,7 @@ class App(QMainWindow):
         self._refresh()
 
     def _card(self) -> tuple[QFrame, QVBoxLayout]:
-        """Crea un contenedor tipo 'tarjeta' con sombra suave."""
         card = QFrame()
-        # OJO: si se concatena un f-string con {{ }} y un string normal con
-        # }} sueltas, el }} del string normal NO se escapa (solo se escapa
-        # dentro del propio f-string) y sobra una llave de cierre, lo que
-        # hace que Qt descarte toda la hoja de estilos del QFrame. Por eso
-        # va todo en un único f-string.
         card.setStyleSheet(
             f"QFrame {{ background-color: {Theme.SURFACE}; border: 1px solid {Theme.BORDER}; "
             f"border-radius: 10px; }}"
@@ -709,8 +813,6 @@ class App(QMainWindow):
     def _seccion_titulo(self, texto: str) -> QLabel:
         lbl = QLabel(texto)
         lbl.setFont(QFont(Theme.FONT_FAMILY, 12, QFont.Weight.Bold))
-        # font-size va en el stylesheet propio (ver nota en _ui()): la regla
-        # global QLabel{font-size:10pt} de lo contrario aplasta este tamaño.
         lbl.setStyleSheet(
             f"color: {Theme.PRIMARY_DARK}; background: transparent; "
             "font-size: 12pt; font-weight: bold;"
@@ -737,7 +839,6 @@ class App(QMainWindow):
         self.matricula_edit.setFixedWidth(220)
         self.matricula_edit.setPlaceholderText("Ej. 1234567")
         self.matricula_edit.setMaxLength(Config.MATRICULA_MAX)
-        # Solo permite escribir dígitos: evita errores de captura desde el origen.
         self.matricula_edit.setValidator(
             QRegularExpressionValidator(
                 QRegularExpression(rf"^[0-9]{{0,{Config.MATRICULA_MAX}}}$")
@@ -875,7 +976,6 @@ class App(QMainWindow):
     # ----------------------------------------------------------
 
     def _set_busy(self, ocupado: bool):
-        """Deshabilita botones durante operaciones para evitar doble clic."""
         self.btn_prestar.setEnabled(not ocupado)
         self.btn_devolver.setEnabled(not ocupado)
         if ocupado:
@@ -894,7 +994,6 @@ class App(QMainWindow):
         equipos_ocupados = {p["equipo"]    for p in activos}
         proy_ocupados    = {p["proyector"] for p in activos}
 
-        # Poblar comboboxes con equipos disponibles, preservando selección actual
         equipo_actual = self.cb_equipo.currentText()
         proy_actual   = self.cb_proy.currentText()
 
@@ -913,14 +1012,13 @@ class App(QMainWindow):
         self.cb_proy.setCurrentText(proy_actual if proy_actual in valores_proy else Config.SIN_PROYECTOR)
         self.cb_proy.blockSignals(False)
 
-        # Opciones de devolución
         seleccion_actual = self.cb_devolucion.currentText()
         self.devoluciones_map.clear()
         opciones = []
         for p in activos:
             limite = self._parse_dt(p.get("hora_limite"))
             if limite is None:
-                continue  # registro dañado: se omite en vez de tronar la UI
+                continue
             restante = int((limite - ahora).total_seconds() / 60)
             aviso = (
                 f"⚠ {restante} min" if 0 < restante <= Config.ALERTA_MINUTOS
@@ -939,9 +1037,6 @@ class App(QMainWindow):
             self.cb_devolucion.setCurrentText("")
         self.cb_devolucion.blockSignals(False)
 
-        # Como las señales estaban bloqueadas arriba, hay que refrescar el
-        # detalle (cuenta regresiva) a mano; si no, el texto de "min
-        # restantes" se quedaba congelado entre refrescos automáticos.
         if not opciones:
             self.info_label.setText("Sin préstamos activos.")
         elif seleccion_actual in opciones:
@@ -949,7 +1044,6 @@ class App(QMainWindow):
         else:
             self.info_label.setText("Selecciona un préstamo para ver detalles.")
 
-        # Tabla con filtro por matrícula
         filas = [p for p in activos if not filtro or filtro in p["matricula"]]
         self.tabla.setRowCount(len(filas))
 
@@ -962,8 +1056,6 @@ class App(QMainWindow):
         for row, p in enumerate(filas):
             limite = self._parse_dt(p.get("hora_limite"))
             if limite is None:
-                # Registro con fecha inválida: se muestra igual pero marcado como vencido,
-                # en vez de tronar toda la tabla.
                 restante = -1
             else:
                 restante = (limite - ahora).total_seconds() / 60
@@ -990,12 +1082,10 @@ class App(QMainWindow):
                 self.tabla.setItem(row, col, item)
 
     def _monitorear(self):
-        """Revisa vencimientos cada minuto; notifica una sola vez por préstamo."""
         activos     = self.db.activos()
         ahora       = datetime.datetime.now()
         ids_activos = {p["id"] for p in activos}
 
-        # Limpiar IDs ya devueltos del set de notificados
         self._notificados &= ids_activos
 
         vencidos_nuevos = []
@@ -1008,8 +1098,6 @@ class App(QMainWindow):
                 self._notificados.add(p["id"])
                 vencidos_nuevos.append(p)
 
-        # Se agrupan todos los vencimientos nuevos en un solo aviso, en vez
-        # de abrir una ventana modal por cada préstamo vencido.
         if vencidos_nuevos:
             detalle = "\n".join(
                 f"• Matrícula {p['matricula']} — {p['equipo'] or '-'} / {p['proyector'] or '-'}"
@@ -1092,7 +1180,6 @@ class App(QMainWindow):
             prestamo = self.service.crear_prestamo(matricula, salon, equipo, proy, extras)
             self.excel.actualizar_o_agregar(prestamo)
         except Exception as e:
-            # Antes: cualquier excepción no prevista aquí tumbaba toda la app.
             QMessageBox.critical(
                 self, "Error inesperado",
                 f"Ocurrió un error al registrar el préstamo:\n{e}",
@@ -1101,7 +1188,6 @@ class App(QMainWindow):
         finally:
             self._set_busy(False)
 
-        # Limpiar formulario
         self.matricula_edit.clear()
         self.salon_edit.clear()
         for chk in self.extras_checks.values():

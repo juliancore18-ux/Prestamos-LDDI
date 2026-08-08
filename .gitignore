@@ -1,4 +1,17 @@
+# PyInstaller
 build/
 dist/
+*.spec
+
+# Python
 __pycache__/
 *.pyc
+
+# Base de datos SQLite
+*.db
+*.sqlite
+*.sqlite3
+
+# Archivos generados por la aplicación
+PRESTAMOS.xlsx
+*.migrado
